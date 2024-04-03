@@ -1,3 +1,5 @@
+# Tools for using on MiSTer
+
 This is an attempt at making MiSTer FPGA transparently use
 a remote storage device.
 
@@ -9,12 +11,11 @@ into the `mister_fpga` directory and then running
 ```
 
 should work. It will mount the referenced block device
-into /tmp/.remote/lower and then layers an overlayfs
+into `/tmp/.remote/lower` and then layers an overlayfs
 on top of that to allow writing. This also currently
-sucks, as /tmp is a tmpfs (so had limited space)
-and using /media/fat (and exfat) doesn't work as that
-type of FS doesn't seem supported
-for an upper layer.
+sucks, as `/tmp` is a tmpfs (so has limited space)
+and using `/media/fat` (an exfat) doesn't work as that
+type of FS doesn't seem supported as an upper layer.
 
 An additional issue seems to be case insensitivity of
 filenames and some issue in exfat that prevents it from
@@ -23,7 +24,7 @@ being used:
  * Using ext4 is cumbersome as MiSTer doesn't properly handle
    case sensitivity. While ext4 now has a mode to support
    casefolding, I didn't try that yet.
-   Simply using an ext4 image with -O casefold doesn't
+   Simply using an ext4 image with `-O casefold` doesn't
    mount with:
 
    ```

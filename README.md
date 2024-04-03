@@ -277,7 +277,6 @@ together with the UnlockKey to access all that.
    resize the filesystem. Sparse files take up no
    extra space on the disk and `nbd-chunk-import` knows how to
    compress them efficiently.
-
    The reuse of chunks should only add a few extra
    chunks as a result.
 
