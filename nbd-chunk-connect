@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2024 by Florian Wesch <fw@dividuum.de>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+import os
+import re
+import sys
+import errno
+import struct
+import traceback
+import binascii
+import argparse
+import socket
+import threading
+from urllib.parse import urlparse, unquote
+from tree_chunker import ChunkCacheMemory, ChunkLoaderHTTP, ChunkReader
+
+# 64bit capable ioctl
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+def ioctl(fd, command, arg):
+    if arg >= 0x80000000:
+        arg = ctypes.c_uint64(arg)
+    ret = libc.ioctl(fd, command, arg)
+    if ret < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    return ret
+
+def nbd_connect(dev_name, sock, reader):
+    NBD_SET_SOCK = 0xab00
+    NBD_SET_BLKSIZE = 0xab01
+    NBD_DO_IT = 0xab03
+    NBD_CLEAR_SOCK = 0xab04
+    NBD_CLEAR_QUE = 0xab05
+    NBD_SET_SIZE_BLOCKS = 0xab07
+    NBD_SET_FLAGS = 0xab0a
+    NBD_FLAG_READ_ONLY = 1<<0 | 1<<1
+
+    with open(dev_name, 'r+b') as nbd:
+        nbd_fd = nbd.fileno()
+        ioctl(nbd_fd, NBD_CLEAR_QUE, 0)
+        ioctl(nbd_fd, NBD_CLEAR_SOCK, 0)
+        ioctl(nbd_fd, NBD_SET_SOCK, sock.fileno())
+        ioctl(nbd_fd, NBD_SET_FLAGS, NBD_FLAG_READ_ONLY)
+        ioctl(nbd_fd, NBD_SET_BLKSIZE, reader.block_size)
+        ioctl(nbd_fd, NBD_SET_SIZE_BLOCKS, reader.total_size // reader.block_size)
+        ioctl(nbd_fd, NBD_DO_IT, 0)
+        ioctl(nbd_fd, NBD_CLEAR_SOCK, 0)
+
+def nbd_handler(chunk_reader, sock):
+    NBD_REQUEST = 0x25609513
+    NBD_RESPONSE = 0x67446698
+    NBD_CMD_READ = 0
+    NBD_CMD_DISC = 2
+
+    read = sock.makefile('rb').read
+    write = sock.sendall
+    while 1:
+        header = read(28)
+        if len(header) != 28:
+            break
+        try:
+            magic, cmd, handle, offset, length = struct.unpack(">LLQQL", header)
+        except struct.error:
+            raise IOError("Invalid request, disconnecting")
+        if magic != NBD_REQUEST:
+            raise IOError("Bad magic number, disconnecting")
+        if cmd == NBD_CMD_DISC:
+            sys._exit(0)
+        elif cmd == NBD_CMD_READ:
+            try:
+                print(f'=> read {length} @ {offset}')
+                data = chunk_reader.read_at(offset, length)
+            except Exception as ex:
+                traceback.print_exc()
+                write(struct.pack('>LLQ', NBD_RESPONSE, errno.ENOENT, handle))
+                continue
+            write(struct.pack('>LLQ', NBD_RESPONSE, 0, handle))
+            write(data)
+        else:
+            raise IOError("Invalid operation")
+
+def chunk_url_arg(arg):
+    url = urlparse(arg)
+    unlock_key = unquote(url.fragment)
+    if not unlock_key:
+        if sys.stdin and sys.stdin.isatty():
+            unlock_key = input("Unlock key for this repository: ")
+        else:
+            raise argparse.ArgumentTypeError('Unlock key missing')
+    paths = url.path.split('/')
+    if not re.match('^[0-9a-f]{64}$', paths[-1]):
+        raise argparse.ArgumentTypeError('Invalid intro url')
+    return (
+        url._replace(path='/'.join(paths[:-2]), fragment=''),
+        binascii.unhexlify(paths[-1]),
+        unlock_key,
+    )
+
+def nbd_dev_arg(arg):
+    if not os.path.exists(arg):
+        raise argparse.ArgumentTypeError(f"{arg} doesn't exist. Is NBD availabe? Try 'modprobe nbd'.")
+    return arg
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog = sys.argv[0],
+        description = 'Connects a chunk repository via HTTP to an NBD device',
+    )
+    parser.add_argument('nbd_dev',
+        help = 'Which block device to use. Example: /dev/nbd0',
+        type = nbd_dev_arg,
+    )
+    parser.add_argument('intro_url',
+        help = 'Where to connect to. Must be in the form http(s)://.../<64hex>#<unlock_key>',
+        type = chunk_url_arg
+    )
+    parser.add_argument('-c', '--cache_size',
+        type = int,
+        help = 'Chunk to cache in memory.',
+        default = 32,
+    )
+    args = parser.parse_args()
+
+    base_url, intro_hash, unlock_key = args.intro_url
+    print(f'Opening repo @ {base_url.geturl()}')
+
+    loader = ChunkLoaderHTTP(base_url)
+    cache = ChunkCacheMemory(max_cached=args.cache_size)
+    reader = ChunkReader(intro_hash, unlock_key.encode('utf8'), loader, cache)
+    print(f'Opened: {reader.total_size/1024/1024:.2f}MB block device')
+
+    our_sock, nbd_sock = socket.socketpair()
+
+    def start_thread(target, *args):
+        thread = threading.Thread(target=target, args=args)
+        thread.daemon = True
+        thread.start()
+        return thread
+
+    threads = (
+        start_thread(nbd_connect, args.nbd_dev, nbd_sock, reader),
+        start_thread(nbd_handler, reader, our_sock),
+    )
+
+    try:
+        for thread in threads:
+            thread.join()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
