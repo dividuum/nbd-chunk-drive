@@ -102,7 +102,7 @@ the `demo.img` file or import additional block devices.
 ## Example: Accessing the content of a repository
 
 You'll need the intro URL to open an imported chunked block device.
-You can create that using the output of the `nbd-chunk-create` run above..
+You can create that using the output of the `nbd-chunk-import` run above..
 
 ```
 f2f4fc043b7df808e68fe928ebaee54e2326e01d62e6e05617b4519c74da91ff#UnlockKey
