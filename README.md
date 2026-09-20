@@ -245,7 +245,7 @@ together with the UnlockKey to access all that.
    flaws. No promises are made. Feel free to provide
    feedback.
 
- * I wrote this to see if its possible to mount a
+ * I wrote this to see if it's possible to mount a
    HTTP based, versioned and remote repository of my
    games stored on my MiSTer FPGA machine after my
    first SD card died.
